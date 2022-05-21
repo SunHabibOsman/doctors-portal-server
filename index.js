@@ -2,9 +2,39 @@
 const express = require('express')
 const app = express()
 require('dotenv').config()
+const stripe = require("stripe")(process.env.SK_LIVE_KEY);
+
+app.use(express.static("public"));
+app.use(express.json());
+
+const calculateOrderAmount = (items) => {
+  // Replace this constant with a calculation of the order's amount
+  // Calculate the order total on the server to prevent
+  // people from directly manipulating the amount on the client
+  return 1400;
+};
+
+// app.post("/create-payment-intent", async (req, res) => {
+//   const { items } = req.body;
+
+//   // Create a PaymentIntent with the order amount and currency
+//   const paymentIntent = await stripe.paymentIntents.create({
+//     amount: calculateOrderAmount(items),
+//     currency: "eur",
+//     automatic_payment_methods: {
+//       enabled: true,
+//     },
+//   });
+
+//   res.send({
+//     clientSecret: paymentIntent.client_secret,
+//   });
+// });
+
+app.listen(4242, () => console.log("Node server listening on port 4242!"));
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
-const { MongoClient, ServerApiVersion, LEGAL_TCP_SOCKET_OPTIONS } = require('mongodb');
+const { MongoClient, ServerApiVersion, LEGAL_TCP_SOCKET_OPTIONS, ObjectId } = require('mongodb');
 const { get } = require('express/lib/response');
 const port = process.env.PORT || 5000;
 
@@ -20,12 +50,12 @@ app.use(express.json())
 
 function verifyJWT(req, res, next) {
   const authorization = req.headers.authorization;
-  console.log(authorization);
+
   if (!authorization) {
     return res.status(401).send({ message: "Unauthorized" })
   }
   const token = authorization.split(' ')[1];
-  console.log(token);
+
 
   jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, function (err, decoded) {
     if (err) {
@@ -40,18 +70,46 @@ function verifyJWT(req, res, next) {
 }
 
 
+
 async function run() {
   try {
     await client.connect()
-    const doctorsCollection = client.db("doctors_portal").collection("appointment");
+    const doctorsAppoinment = client.db("doctors_portal").collection("appointment");
     const bookingCollection = client.db("doctors_portal").collection("Booking");
     const userCollection = client.db("doctors_portal").collection("user");
+    const doctorsCollection = client.db("doctors_portal").collection("doctors");
+    const paymentCollection = client.db("doctors_portal").collection("payment");
+    const verifyAdmin = async (req, res, next) => {
+      const requester = req.decoded.email;
+      const requestFind = await userCollection.findOne({ email: requester });
+      if (requestFind.role === 'admin') {
+        next()
+      }
+      else {
+
+        return res.status(403).send({ message: "Forbidden" })
+
+      }
+
+    }
+
+    app.post('/create-payment-intent', verifyJWT, async (req, res) => {
+      const service = req.body;
+      const price = service.price;
+      const amount = price * 100;
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: 'usd',
+        payment_method_types: ['card']
+      });
+      res.send({ clientSecret: paymentIntent.client_secret })
+    });
 
 
     app.get('/service', async (req, res) => {
       const query = {}
-      const cursor = doctorsCollection.find(query)
-      const result = await cursor.toArray()
+      const cursor = doctorsAppoinment.find(query).project({ name: 1 });
+      const result = await cursor.toArray();
       res.send(result)
     })
     app.get('/admin/:email', async (req, res) => {
@@ -65,26 +123,40 @@ async function run() {
       res.send({ admin: isAdmin })
     })
 
-    app.put('/user/admin/:email', verifyJWT, async (req, res) => {
+    app.put('/user/admin/:email', verifyJWT, verifyAdmin, async (req, res) => {
       const email = req.params.email;
-      const requester = req.decoded.email;
-      const requestFind = await userCollection.findOne({ email: requester });
-      if (requestFind.role === 'admin') {
-        const filter = { email: email };
 
-        const updateDoc = {
-          $set: { role: "admin" },
 
-        };
+      const filter = { email: email };
 
-        const result = await userCollection.updateOne(filter, updateDoc);
-        res.send({ result });
-      }
-      else {
-        return res.status(403).send({ message: "Forbidden" })
-      }
+      const updateDoc = {
+        $set: { role: "admin" },
+
+      };
+
+      const result = await userCollection.updateOne(filter, updateDoc);
+      res.send({ result });
+
+
 
     })
+
+    app.patch('/booking/:id', verifyJWT, async (req, res) => {
+      const id = req.params.id;
+      const payment = req.body;
+      const filter = { _id: ObjectId(id) };
+      const updatedDoc = {
+        $set: {
+          paid: true,
+          transactionId: payment.transactionId
+        }
+      }
+
+      const result = await paymentCollection.insertOne(payment);
+      const updatedBooking = await bookingCollection.updateOne(filter, updatedDoc);
+      res.send(updatedBooking);
+    })
+
     app.put('/user/:email', async (req, res) => {
       const email = req.params.email;
       const user = req.body;
@@ -127,6 +199,14 @@ async function run() {
       const result = await bookingCollection.insertOne(booking);
       res.send({ success: true, result })
     })
+    app.get('/booking/:id', verifyJWT, async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: ObjectId(id) }
+      const result = await bookingCollection.findOne(query)
+      res.send(result)
+    })
+
+
     app.get('/booking', verifyJWT, async (req, res) => {
       const patient = req.query.patient;
 
@@ -146,6 +226,10 @@ async function run() {
       const user = await userCollection.find().toArray();
       res.send(user)
     })
+    app.get('/doctor', verifyJWT, verifyAdmin, async (req, res) => {
+      const doctor = await doctorsCollection.find().toArray();
+      res.send(doctor)
+    })
 
     app.get('/available', async (req, res) => {
       const date = req.query.date;
@@ -154,7 +238,7 @@ async function run() {
       //  step 1 :get all access services 
 
 
-      const services = await doctorsCollection.find().toArray();
+      const services = await doctorsAppoinment.find().toArray();
 
 
       // step 2 : get the booking of that day
@@ -174,6 +258,19 @@ async function run() {
         service.slots = available;
       })
       res.send(services)
+
+    })
+    app.post('/doctor', verifyJWT, verifyAdmin, async (req, res) => {
+      const body = req.body;
+      const result = await doctorsCollection.insertOne(body)
+      res.send(result)
+
+    })
+    app.delete('/doctor/:email', verifyJWT, verifyAdmin, async (req, res) => {
+      const email = req.params.email;
+      const query = { email: email }
+      const result = await doctorsCollection.deleteOne(query)
+      res.send(result)
 
     })
 
